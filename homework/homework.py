@@ -96,3 +96,173 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import os
+import zipfile
+import pandas as pd
+import numpy as np
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.neural_network import MLPClassifier
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+)
+import json
+import joblib
+import gzip
+
+# Paso 1: Limpieza de datos
+def clean_data(df):
+    df = df.rename(columns={"default payment next month": "default"})
+    df = df.drop(columns=["ID"], errors="ignore")
+    df = df.dropna()  # Eliminar registros con valores faltantes
+    df["EDUCATION"] = df["EDUCATION"].apply(lambda x: x if x <= 4 else 4)
+    return df
+
+# Paso 2: División de datos en X e y
+def split_data(df):
+    X = df.drop(columns=["default"])
+    y = df["default"]
+    return X, y
+
+# Paso 3: Crear el pipeline con MLP y PCA
+def create_pipeline():
+    # Columnas categóricas y numéricas
+    categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
+    numeric_features = [
+        "LIMIT_BAL",
+        "AGE",
+        "PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6",
+        "BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6",
+        "PAY_AMT1", "PAY_AMT2", "PAY_AMT3", "PAY_AMT4", "PAY_AMT5", "PAY_AMT6",
+    ]
+    
+    # Transformaciones
+    preprocessor = ColumnTransformer(
+        transformers=[ 
+            ("cat", OneHotEncoder(), categorical_features),
+            ("num", MinMaxScaler(), numeric_features),
+        ]
+    )
+    
+    # Pipeline
+    pipeline = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("pca", PCA()),  # Descomponer con PCA (todas las componentes)
+            ("feature_selection", SelectKBest(score_func=f_classif, k=20)),
+            ("classifier", MLPClassifier(hidden_layer_sizes=(100,), max_iter=1000, random_state=42)),  # MLP con 1 capa oculta de 100 neuronas
+        ]
+    )
+    return pipeline
+
+# Paso 4: Optimización con validación cruzada
+def optimize_pipeline(X_train, y_train, pipeline):
+    cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+    balanced_precision = cross_val_score(
+        pipeline, X_train, y_train, cv=cv, scoring="balanced_accuracy"
+    )
+    return balanced_precision.mean()
+
+# Paso 5: Guardar el modelo
+def save_model(pipeline, path):
+    with gzip.open(path, "wb") as f:
+        joblib.dump(pipeline, f)
+
+# Paso 6 y 7: Calcular métricas y matriz de confusión
+def calculate_metrics_and_cm(X, y, pipeline, dataset_type):
+    y_pred = pipeline.predict(X)
+    metrics = {
+        "type": "metrics",
+        "dataset": dataset_type,
+        "precision": precision_score(y, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y, y_pred),
+        "recall": recall_score(y, y_pred),
+        "f1_score": f1_score(y, y_pred),
+    }
+    
+    cm = confusion_matrix(y, y_pred)
+    cm_dict = {
+        "type": "cm_matrix",
+        "dataset": dataset_type,
+        "true_0": {"predicted_0": cm[0, 0], "predicted_1": cm[0, 1]},
+        "true_1": {"predicted_0": cm[1, 0], "predicted_1": cm[1, 1]},
+    }
+    return metrics, cm_dict
+
+# Convertir todo a tipos estándar de Python antes de guardar
+def convert_to_serializable(obj):
+    if isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_serializable(v) for v in obj]
+    elif isinstance(obj, (np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.float64, np.float32)):
+        return float(obj)
+    return obj
+
+# Ejecutar todo
+def main():
+    # Rutas de los archivos
+    input_dir = "files/input/"
+    output_dir = "files/output/"
+    model_path = "files/models/model.pkl.gz"
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    
+    # Descomprimir y cargar datos
+    train_zip_path = os.path.join(input_dir, "train_data.csv.zip")
+    test_zip_path = os.path.join(input_dir, "test_data.csv.zip")
+    train_inner_file = "train_default_of_credit_card_clients.csv"
+    test_inner_file = "test_default_of_credit_card_clients.csv"
+    
+    def unzip_and_load(zip_path, inner_file):
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extract(inner_file, input_dir)
+        return pd.read_csv(os.path.join(input_dir, inner_file))
+    
+    train_data = unzip_and_load(train_zip_path, train_inner_file)
+    test_data = unzip_and_load(test_zip_path, test_inner_file)
+    
+    # Limpieza
+    train_data = clean_data(train_data)
+    test_data = clean_data(test_data)
+    
+    # Dividir datos
+    X_train, y_train = split_data(train_data)
+    X_test, y_test = split_data(test_data)
+    
+    # Crear pipeline
+    pipeline = create_pipeline()
+    
+    # Entrenar modelo
+    pipeline.fit(X_train, y_train)
+    
+    # Guardar modelo
+    save_model(pipeline, model_path)
+    
+    # Calcular métricas
+    train_metrics, train_cm = calculate_metrics_and_cm(X_train, y_train, pipeline, "train")
+    test_metrics, test_cm = calculate_metrics_and_cm(X_test, y_test, pipeline, "test")
+    
+    # Guardar métricas
+    metrics_path = os.path.join(output_dir, "metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump(
+            convert_to_serializable([train_metrics, test_metrics, train_cm, test_cm]),
+            f,
+            indent=4,
+        )
+
+# Ejecutar script
+if __name__ == "__main__":
+    main()
